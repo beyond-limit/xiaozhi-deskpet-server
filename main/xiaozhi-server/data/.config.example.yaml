@@ -1,0 +1,504 @@
+# ============================================================================
+# 小智AI桌宠 · 服务端配置模板（脱敏版，可直接提交）
+#
+# 用法：
+#   Copy-Item main\xiaozhi-server\data\.config.example.yaml `
+#             main\xiaozhi-server\data\.config.yaml
+#   再把仓库根目录的 .env.example 复制成 .env，填好 Key 即可启动。
+#
+# 凭据全部写成 ${变量名}，由仓库根目录的 .env 提供（见 .env.example）：
+#   ${DEEPSEEK_API_KEY}  对话与截图理解，必填
+#   ${VOLC_APPID}        火山豆包 TTS 的 appid，默认 TTS 就是它，必填
+#   ${VOLC_ACCESS_TOKEN} 火山豆包 TTS 的 access_token，同上
+# 不想用云 TTS：把下面 selected_module.TTS 改回 SapiLocal（Windows 自带、离线、零 Key）。
+# ============================================================================
+
+selected_module:
+  VAD: SileroVAD        # 本地免费
+  ASR: SherpaASR        # 本地免费；改用 ONNX Runtime 跑 SenseVoice，比 FunASR(torch) 快
+                        # 如需回退：改回 FunASR（模型仍在 models/SenseVoiceSmall）
+  LLM: DeepSeekLLM      # 使用用户已有的 DeepSeek API Key
+  TTS: HuoshanDoubleStreamTTSV2  # ← 2026-10-22 起启用火山豆包 2.0（音质最好，按量付费，凭据在 .env）
+                        # 回退方案（改这一行即可，无需动其他配置）：
+                        #   SapiLocal  本机 Windows SAPI，离线零 Key 零额度，机械音（2026-10-13 ~ 10-21 的兜底）
+                        #   EdgeTTS    需先换到一个"干净出口"的代理节点，再把 TTS.EdgeTTS.proxy 填上
+  Intent: function_call # 语音控硬件需要；不需要可改 nointent
+  Memory: nomem         # 后期可改 mem_local_short
+  # 视觉模型：截图兜底用。和文本 LLM 共用同一个 DeepSeek Key / base_url，
+  # 只是 model 换成支持图片输入的 deepseek-flash（见下方 VLLM 段）。
+  VLLM: DeepSeekVLLM
+
+# 浏览器多步操作是“CDP 调用 + 等待页面加载”，单次工具执行可能超过默认 30 秒；
+# 这个值只影响工具调用超时，不会拖慢普通对话。
+tool_call_timeout: 60
+
+LLM:
+  DeepSeekLLM:
+    type: openai
+    model_name: deepseek-v4-flash
+    url: https://api.deepseek.com
+    api_key: "${DEEPSEEK_API_KEY}"   # 真实值放仓库根目录 .env（见 .env.example）
+
+# ── 视觉模型（截图理解）────────────────────────────────────────────────────
+# DeepSeek 的视觉能力走同一个 OpenAI 兼容接口、同一个 Key；用 model 选择
+# 视觉模型即可。若以后官方模型名变化，只改 model_name。
+# 截图只在 browser_act(action="screenshot") 时调用，不会每步都上传。
+VLLM:
+  DeepSeekVLLM:
+    type: openai
+    model_name: deepseek-flash
+    url: https://api.deepseek.com
+    api_key: "${DEEPSEEK_API_KEY}"   # 真实值放仓库根目录 .env（见 .env.example）
+
+# ── TTS：Windows 内置语音合成（离线兜底）── **2026-10-13 ~ 10-21 曾启用，现为回退项** ──
+# 启用理由（当天更新）：EdgeTTS 的 403 与出口 IP 绑定，直连与代理（LAX 机房 IP）双双被拒
+#   （台账 17 节：完全重装 7.2.8、版本号上浮实验均无效），短期内拿不到干净出口；
+#   讯飞免费档有额度、本地 Piper 已清除 → 用户拍板"先暂时用免费无限额的，机械音无所谓，演示前再换"。
+# 为什么当初换掉 EdgeTTS：实测 EdgeTTS 出现**持续 403**（`Invalid response status`），
+# 已排除系统时钟偏差（偏差仅约 20s，远小于阈值），属于服务端风控/限流，
+# 会导致整句合成失败、演示完全没声音。
+# SAPI 的优点：
+#   1) 完全离线、零 Key，不受外部平台风控影响
+#   2) 合成延迟 130~400ms，而 EdgeTTS 每次约 1.2s 固定开销（见 PROGRESS 5.1）
+# 缺点：音质不如豆包/EdgeTTS 自然；只能用系统已安装音色（中文需 zh-CN 语音）。
+#
+# 查看本机可用音色：
+#   python -c "from core.providers.tts.sapi_local import list_installed_voices as f; print(f())"
+# 依赖 pywin32（本机已安装；若换机器需 pip install pywin32）。
+TTS:
+  SapiLocal:
+    type: sapi_local
+    voice: "Microsoft Huihui Desktop"
+    sample_rate: 24000   # 16000 / 22050 / 24000，与设备回程采样率一致可省一次重采样
+    rate: 0              # 语速 -10 ~ 10（SAPI 原生档位）；+1 约快 10%
+    volume: 100          # 音量 0 ~ 100
+    output_dir: tmp/
+  # 保留 EdgeTTS 的覆盖项，改回云 TTS 时只需把上面 selected_module.TTS 改回 EdgeTTS
+  EdgeTTS:
+    type: edge
+    voice: zh-CN-XiaoxiaoNeural
+    output_dir: tmp/
+    # ── 代理（本机 EdgeTTS 能用的**必要条件**）──────────────────────────────
+    # 2026-10-13 实测结论：微软对 readaloud 的 WSS 端点
+    #   wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1
+    # 按来源做**策略性拒绝**——中国大陆出口恒返回「空 body 的 403」，
+    # 而同域名 voices/list 的普通 HTTPS 仍为 200。已排除的全部因素：
+    #   · Sec-MS-GEC 参数：本地复算与 edge-tts 内部值完全一致，带/不带、换时间窗都是 403
+    #   · edge-tts 版本：PyPI 7.2.8 与在装 7.2.6 的常量无差异（端点与版本号都没变）
+    #   · 系统时钟：偏差约 20s，且 voices/list 正常
+    #   · 客户端 TLS 指纹：换 curl 的 TLS 栈同样 403
+    # 因此走代理是本机唯一能让 EdgeTTS 真正可用的办法（edge-tts 原生支持 proxy）。
+    # 填上本地代理地址后即可生效；留空则直连（本机实测会 403）。
+    proxy: ""            # 例：http://127.0.0.1:7890 或 http://127.0.0.1:10808
+
+  # ── 火山「豆包语音合成模型 2.0」（双向流式）── **备选：演示前切它（按量付费）** ──
+  # 2026-10-12 开通后实测通过（selfcheck_volc.py + probe_volc_speaker.py）：
+  #   资源 seed-tts-2.0 已授权；默认音色 zh_female_xiaohe_uranus_bigtts 实测可合成（75822 字节）
+  # ⚠️ 不要改用 HuoshanDoubleStreamTTS：它的 resource_id 是 volc.service_type.10029
+  #    （「大模型语音合成及混音」），本账号**未开通**，握手直接 403。
+  HuoshanDoubleStreamTTSV2:
+    type: huoshan_double_stream
+    ws_url: wss://openspeech.bytedance.com/api/v3/tts/bidirection
+    appid: "${VOLC_APPID}"
+    access_token: "${VOLC_ACCESS_TOKEN}"
+    resource_id: seed-tts-2.0
+    speaker: zh_female_xiaohe_uranus_bigtts
+    # 开启连接复用可省掉每次合成的建连开销（代价：空闲时占 1 个并发额度）
+    enable_ws_reuse: True
+    audio_params:
+      speech_rate: 0
+      loudness_rate: 0
+    additions:
+      post_process:
+        pitch: 0
+    output_dir: tmp/
+
+  # 换音色：在控制台「音色列表」复制音色 ID 填到 speaker；
+  # 先用快测脚本确认真能用（几秒出结果，失败会打印服务端原始报错）：
+  #   python probe_volc_speaker.py zh_female_xxx_bigtts
+
+server:
+  ip: 0.0.0.0
+  port: 8000
+  http_port: 8003
+  # 地址里含"你的"占位符时，OTA 会用本机当前局域网 IP 自动生成 ws://<LOCAL_IP>:8000/xiaozhi/v1/
+  # 注意：不能留空（源码只判"你的"，空串会被原样下发给设备，设备会连不上）
+  websocket: ws://你的ip或者域名:8000/xiaozhi/v1/
+
+# 延迟优化：改用精简模板（原 config.yaml 的 agent-base-prompt.txt 有 6.6KB，
+# 且模板里提到 local_address/weather_info 会触发额外的定位与天气查询）
+# 2026-10-16 更新：模板里只留 local_address（设备所在地，命中缓存后不再请求，
+# 用于让"问天气"的搜索关键词带上城市）；weather_info 已去掉，
+# 会话建立时不再去调和风接口（Key 已 401），天气改走 web_search。
+prompt_template: data/assistant-prompt.txt
+
+# 延迟优化：ASR 固定中文，跳过语种自动检测（省一步推理，也避免误判为日/韩语）
+ASR:
+  FunASR:
+    language: zh
+
+# 说明：以下项经查证是在"小智回答播放完毕"时播提示音（提示该用户说话了），
+# 并不是"用户说完话立刻提示"，因此无法掩盖响应延迟，保持默认关闭。
+# enable_stop_tts_notify: false
+# stop_tts_notify_voice: "config/assets/tts_notify.mp3"
+
+# 抗背景噪声：提高 VAD 判定门槛，远处的背景人声能量较低，不再被判为"有人在说话"
+# 原来 config.yaml 为 threshold: 0.5 / threshold_low: 0.3（偏灵敏）
+# 调得过高的风险：自己说话声小可能不被识别，可回调到 0.55 / 0.35
+VAD:
+  SileroVAD:
+    threshold: 0.65        # 判定为"语音开始"的门槛，调高更抗噪
+    threshold_low: 0.45    # 判定为"语音结束"的门槛，调高更抗噪
+    # 注意：min_silence_duration_ms 保持 config.yaml 的 200，不改。
+    # 调大它只能让"说完"判定更晚（反而增加响应延迟），并不能阻止背景人声被拾取。
+
+# 抗背景噪声：无语音 30 秒就结束这次会话，缩短"麦克风一直开着"的时间窗
+# config.yaml 默认为 120 秒
+close_connection_no_voice_time: 30
+
+# 系统错误时的兜底回复（config.yaml 默认是"主人，小智现在有点忙…"，口吻太出戏）
+system_error_response: "我这边卡了一下，你再说一遍试试？"
+
+# 退出对话时的结束语（2026-10-14 用户要求"缩短一些"）。
+# 无语音超时后，服务端会把这里 prompt 当作用户消息发给 LLM 要一句结束语；
+# config.yaml 的默认那句要求"以时间过得真快开头、富有感情依依不舍地结束"，
+# 模型会讲一大段（桌宠那边听着拖沓）。改成一句话的轻松道别，
+# 与桌宠"说完继续常开麦克风、随时可再唤醒"的行为配套。
+end_prompt:
+  enable: true
+  prompt: |
+    用户已经有一会儿没说话了。请只回一句 12 个字以内、轻松自然的告别语，例如"那我先待机啦，随时喊我～"。
+    不要伤感、不要反问、不要说"时间过得真快"。
+
+# 联网搜索源。
+# config.yaml 里默认是 provider=metaso 且 api_key 为占位符 "mk-xxx"，
+# 实测秘塔对无效 Key 返回 HTTP 200 + {"errCode":2005,"errMsg":"API密钥无效"}，
+# 导致搜索必然失败。这里改用「免 Key」多引擎搜索源 free：
+#   按 搜狗 → 360 → 百度 → Bing 依次尝试，并用相关性校验剔除被反爬降级的通用结果页
+#   （实测搜狗/360/百度连续多轮结果稳定且相关；Bing 在连续请求后会返回无关结果）
+#
+# 注意：免 Key 方案依赖搜索引擎页面结构，属于 best-effort，长期看不如官方 API 稳定。
+# 若要更稳，把 provider 换成 tavily / metaso / serply 并填上对应平台的 Key
+# （Tavily 有免费额度：https://app.tavily.com/home）：
+#   provider: tavily
+#   api_key: "tvly-xxxxxxxx"
+plugins:
+  web_search:
+    provider: free
+    max_results: 5
+    # 工具描述（覆盖插件内置描述，见 plugin_executor._get_plugin_description）：
+    # 把"问天气"这一类问题明确划给联网搜索。
+    # 背景（2026-10-16 用户要求）：和风天气共用 Key 已失效（HTTP 401，见 PROGRESS 7.2），
+    # 因此把 get_weather 从下面 Intent.function_call.functions 里去除，
+    # 天气一律走本工具的免 Key 多引擎搜索，不再单独维护天气接口。
+    description: >-
+      联网搜索工具。用户询问天气、气温、下雨、要不要带伞，以及任何需要实时或联网信息的问题时，
+      使用此工具；query 用简短关键词，查天气时写成"城市名 + 时间 + 天气"（例如"北京明天天气"）：
+      用户说的时间词（今天/明天/后天/周末）必须保留，漏掉就会被当成查今天；
+      用户没说城市时可以只写"明天天气"，服务端会自动补上设备所在地。
+      先调用本工具、拿到结果再回答，不要回答"我查不了天气"。
+
+  # ── 本机软件调用（语音："打开 WorkBuddy""关掉微信"）────────────────────────
+  # 白名单机制：只有登记在 apps 里的软件才允许被小智启动/关闭，
+  # 工具不接受任意命令行，避免把整机控制权交给大模型。
+  #   name      语音/工具里使用的软件名（必填）
+  #   path      可执行文件或快捷方式路径（必填）
+  #   aliases   别名，方便口语化说法命中（可选）
+  #   process   用于查找进程的映像名，默认取 path 的文件名（可选，可写多个）
+  #   args      启动参数（可选）
+  #   input     是否允许把 text 输入到该软件窗口，覆盖全局 allow_input（可选）
+  #   submit    粘贴后是否自动回车提交，默认 true（可选）
+  #   close     graceful（默认，走 WM_CLOSE 优雅关闭）| off（禁止语音关闭）
+  #             默认值只作为兜底：桌宠「设置 → 软件管理」里每行的开关（含批量）
+  #             会写到 data/local_apps.json 的 overrides.close 并优先生效。
+  #   force_close  超时未退出时是否强杀，默认 false（可选）
+  local_app:
+    # 全局开关：是否允许把 text 输入到目标软件窗口
+    allow_input: true
+    # 启动后等待进程/窗口出现的最长秒数
+    window_timeout: 12
+    # 记事本记录落盘的文件，相对服务端工作目录，两个能力共用：
+    #   1) write_note              一次性记录："帮我记一下明天三点开会"
+    #   2) start/stop_note_capture 持续记录："接下来我说的都记下来，直到我说停止"
+    # 记录都是追加写入（带时间戳），write_note 写完会自动用记事本打开给用户看。
+    # 之所以直接写文件而不是往记事本窗口粘贴：粘贴依赖窗口前台焦点，
+    # 用户说话时前台通常是浏览器，会出现"剪贴板里有、记事本里没有"。
+    note_file: data/notes/xiaozhi-notes.txt
+    # 内置软件清单保持为空；可操作软件只来自用户主动扫描或软件管理中的手动添加。
+    # 扫描/手动结果独立保存在 data/local_apps.json，不会再混入固定示例项。
+    apps: []
+
+    # app_act / app_task 允许的动作（可按单个软件用 actions 覆盖）。
+    # type 仍受每个软件/全局的 input 开关限制。
+    actions: [focus, type, press, hotkey, click, set_text, inspect, read, minimize, maximize, restore, wait]
+
+    # 多步操作宏（app_task 用）：键是软件名，键名是宏名。两种写法都支持：
+    #   旧写法：宏名: [ {action: ...}, ... ]
+    #   新写法：宏名: {when: [...], params: {...}, expect: "...", steps: [...]}
+    # - when   ：用户原话里出现这些词时，app_task 的 mode=auto 会自动选中这个宏；
+    # - params ：把 {占位符} 映射到调用参数（{text} = app_task 的 text 参数）；
+    # - expect ：整段跑完后窗口/结果里应出现的文字，不满足就停在最后并把当前窗口回报给模型；
+    # - 步骤里的 save_document：把文字存成 txt / word / excel（target 填格式，path 可选）。
+    #   记事本那条走「先按目标路径建空文件 → notepad 打开 → 粘贴 → Ctrl+S」，
+    #   保存的是已有路径，不会弹「另存为」对话框。
+    # 软件名按语音清单里的显示名填；"Word" 也能命中 "Microsoft Word"（包含匹配）。
+    app_macros:
+      记事本:
+        new_write:
+          when: [记事本, 新建, 记录, 写下, 存成文本]
+          params: {text: "{text}"}
+          expect: 小智记录
+          steps:
+            - {action: save_document, target: txt, value: "{text}"}
+      Word:
+        new_write:
+          when: [word, 文档, 新建文档, 存成文档]
+          params: {text: "{text}"}
+          expect: 小智记录
+          steps:
+            - {action: save_document, target: word, value: "{text}"}
+      Excel:
+        new_write:
+          when: [excel, 表格, 工作表, 存成表格]
+          params: {text: "{text}"}
+          expect: 小智记录
+          steps:
+            - {action: save_document, target: excel, value: "{text}"}
+
+  # ── Edge 浏览器操作（语音："打开 Edge""搜索…""点第二个"）──────────────────
+  # 页面内动作走 CDP（DevTools 协议），不依赖鼠标坐标；每次只执行一句话里的
+  # 一个动作，执行结果会写进对话历史，下一句"点第二个"才有依据。
+  #
+  # 为什么要独立配置目录：
+  #   Chromium 的 --remote-debugging-port 只对"拥有该 user-data-dir 的进程"生效。
+  #   日常 Edge 已经运行时，再带参数启动只会把请求转交给已有实例，端口不会打开。
+  #   因此这里用 data/edge-profile 另起一个专用实例：
+  #     - 不打扰日常 Edge 的窗口/登录态；
+  #     - 9222 只暴露演示账号，安全边界更小；
+  #     - 演示完可以直接删掉 data/edge-profile 重建。
+  # 首次启动后在这个 Edge 窗口里登录一次要操作的网站即可，之后会保留。
+  browser_control:
+    app_name: Edge浏览器
+    # 留空自动探测（Program Files / Program Files (x86) / 注册表）
+    edge_path: ""
+    port: 9222
+    user_data_dir: "data/edge-profile"
+    # 搜索动作的地址模板；{query} 会被 URL 编码后的关键词替换
+    search_url: "https://www.bing.com/search?q={query}"
+    # 站内搜索：当前页面 host 命中时，search 直接打开该网站自己的搜索结果页，
+    # 不再点搜索框（GitHub 这类动态搜索框点开后还要输入+回车，容易只停在输入框）。
+    # 键是域名（子域名也会命中），值是带 {query} 的地址模板。
+    search_sites:
+      github.com: "https://github.com/search?q={query}&type=repositories"
+      gitee.com: "https://search.gitee.com/?q={query}&type=repository"
+      www.zhihu.com: "https://www.zhihu.com/search?type=content&q={query}"
+      search.bilibili.com: "https://search.bilibili.com/all?keyword={query}"
+    # 截图保存目录（只保存当前标签页，不截整个桌面）
+    screenshot_dir: "data/browser_shots"
+    keep_screenshot: true
+    # 没有配 VLLM 时截图仍会保存，但不会做视觉分析
+    vision_enabled: true
+    start_timeout: 15       # 启动 Edge 后等调试端口就绪的秒数
+    nav_timeout: 12         # 打开网址后等页面加载的秒数
+    action_timeout: 30      # 单个 browser_act 动作的总超时
+    max_candidates: 40      # 每次最多给模型多少个可点项
+    page_text_limit: 3000   # read 动作最多带回多少字正文
+
+    # ── 连续任务（browser_task）──────────────────────────────────────────
+    # 用户一句话里明确包含多个连续动作时，LLM 一次给出 steps，工具内顺序执行。
+    task_max_steps: 6       # 单次任务最多几步（上限 8）
+    task_timeout: 45        # 整个任务的总超时（秒）
+    step_timeout: 12        # 单步超时（秒）
+
+  # ── 跨软件多步（desktop_task）────────────────────────────────────────────
+  # 一次工具调用里串起「本机软件 + Edge + 保存文件」，用于
+  # 「查一下 X 并记到记事本」「把网页内容整理成 Word」这类横跨软件的一句话需求。
+  # 固定边界（不随配置放宽）：最多 8 步、总超时 60 秒、单步 15 秒、中间静默、失败即停。
+  # 这样做的好处是**不提高 core/connection.py 的 MAX_DEPTH**，也不多消耗对话轮次。
+  desktop_task:
+    # 跨软件宏（宏优先、steps 兜底）：when 命中用户原话时自动执行。
+    # 步骤字段：
+    #   via      browser=Edge / app=本机软件（没写 app 就用工具参数里的 app_name）
+    #   action   软件动作 / Edge 动作 / save_document
+    #   capture  把这一步读到的正文存成变量（单次最多 2000 字），后续用 {变量名} 引用
+    #   path     save_document 可选：用户明确说了路径时照抄
+    macros:
+      research_to_notepad:
+        when: [查一下, 查资料, 搜一下, 搜索, 记到记事本, 记下来]
+        params: {text: "{text}"}
+        steps:
+          - {via: browser, action: search, value: "{text}"}
+          - {via: browser, action: read, capture: page}
+          - {action: save_document, target: txt, value: "{page}"}
+      research_to_word:
+        when: [查, 搜, 资料, word, 文档]
+        params: {text: "{text}"}
+        steps:
+          - {via: browser, action: search, value: "{text}"}
+          - {via: browser, action: read, capture: page}
+          - {action: save_document, target: word, value: "{page}"}
+      research_to_excel:
+        when: [查, 搜, 资料, excel, 表格]
+        params: {text: "{text}"}
+        steps:
+          - {via: browser, action: search, value: "{text}"}
+          - {via: browser, action: read, capture: page}
+          - {action: save_document, target: excel, value: "{page}"}
+
+  # ── 点歌（语音："播放稻香""来一首周杰伦的稻香"）────────────────────────────
+  # 替代上游自带的 play_music（它只认 music 目录里预置的几首歌，找不到
+  # 指定歌曲时会"随机播一首"，用户会误以为"只会播固定的几首歌"）。
+  # 本插件的行为：
+  #   1) 先在 music_dirs 里按歌名模糊匹配（支持"歌手 - 歌名"文件名）；
+  #   2) 本地没有时并发搜索 网易云 + 咪咕 两个免 Key 音源，逐个候选取流下载
+  #      到 cache_dir；下一次点同一首歌直接命中缓存；
+  #   3) 用户点名了歌手（如"林俊杰的黑夜问白天"）时只播这位歌手的版本，
+  #      拿不到就如实说"受版权限制播不了"，绝不拿别人翻唱的版本糊弄；
+  #   4) 本地与在线都找不到时如实回一句"没找到"，绝不乱播别的歌。
+  # 音源均免 Key、best-effort：版权受限的歌（网易云 302 到 HTML、咪咕回
+  # "暂不提供试听地址"）可能全部拿不到，此时会如实说明并建议换一首。
+  online_music:
+    music_dirs:
+      - ./music                 # 服务端自带曲库（相对服务端工作目录）
+      # - "%USERPROFILE%/Music" # 也可以挂自己电脑上的音乐目录（可多个）
+    online: true                # 本地没有时是否联网点歌（false = 只用本地曲库）
+    cache_dir: ./music/online   # 在线歌曲缓存目录（自动创建）
+    # "随便放首歌"的策略：true = 先拉网易云热歌榜、随机挑一首（会有一次联网搜索+下载，
+    # 冷启动约 5~15 秒）；false = 退回旧行为，直接从本地曲库/缓存里随机。
+    hot_random: true
+    search_limit: 10            # 每个音源的搜索候选数
+    max_candidates: 5           # 最多尝试取流的候选数（覆盖多个音源）
+    timeout: 8                  # 单次 HTTP 超时（秒）
+    max_file_mb: 30             # 单曲下载大小上限
+    # B 站兜底源：网易云/咪咕都拿不到时（如版权独家歌），用 B 站的现场版/搬运
+    # 取音频（依赖 yt-dlp：pip install yt-dlp）。关掉它就只用前两个音源。
+    bilibili: true
+    bilibili_limit: 6           # B 站搜索取前几个视频
+    # 背景音乐模式：客户端声明支持 features.bgm（桌宠已支持）时，音乐由客户端
+    # 本地独立播放器播放（服务端只下发 /music/xxx 文件 URL）——
+    # 音乐不驱动 Live2D 口型、也不会被后续对话打断，如同一路背景音。
+    # 关掉则回退到走 TTS 音频流（与 ESP32 等设备行为一致）。
+    background: true
+    background_volume: 0.35     # 背景音乐音量（0.05~1.0，语音播报不受影响）
+    # 播放位置（2026-10-19 方案B）：
+    #   auto   = 客户端声明 features.bgm 就走客户端播放（桌宠），否则走服务端播放（ESP32）
+    #   client = 强制客户端 <audio> 播放（桌宠）
+    #   device = 强制走 TTS 音频流（上游老行为，音乐和语音共用一条流）
+    #   server = 强制服务端播放进程：音乐从服务器本机扬声器出声，不占设备音频流
+    # 服务端播放是**独立进程**：对话打断、桌宠退出、ESP 断线都不会停音乐。
+    playback: auto
+    server_volume: 0.35         # 服务端播放音量（0~1，独立于系统音量/说话音量）
+    server_start_delay: 1.0     # 播报"正在为您播放"后延迟多少秒起音乐（0=立刻）
+    server_fade_in: 0.8         # 服务端播放淡入时长（秒）
+
+  # ── 文件查找（语音："帮我找一下报告""桌面上有没有 PDF"）────────────────────
+  # 只在允许的目录里按文件名查找，不全盘扫描；找到后：
+  #   1) 给桌宠下发结果面板（可点击打开 / 在文件夹里显示）；
+  #   2) 语音播报"找到 N 个文件：…"，用户接着说"打开第一个"即可打开。
+  # 允许的目录有三种来源：
+  #   1) roots      常用目录：可写关键字（走 Windows 已知文件夹，能正确处理
+  #                 "桌面/文档被重定向到别的盘"），也可写绝对路径；
+  #   2) extra_dirs 额外目录：绝对路径，可多条（挂工作目录用这个）；
+  #   3) whole_pc   true = 一键放开整台电脑（所有可访问盘符），
+  #                 此时 roots / extra_dirs 不再起作用。
+  # 关键字：desktop 桌面 / documents 文档 / downloads 下载 / pictures 图片 /
+  #        music 音乐 / videos 视频 / home 用户目录
+  file_search:
+    roots:
+      - desktop
+      - documents
+      - downloads
+      - pictures
+      - music
+      - videos
+      # - home              # 整个用户目录（更全，但会把游戏存档等一并扫进来）
+    # 额外允许查找的目录（绝对路径，可多条）；项目工作目录：
+    extra_dirs:
+      # - "D:\\你的项目目录"    # ← 换成自己的路径；不需要就整行删掉，只用桌面/文档/下载等已知目录
+      # - "D:\\lxj\\文档\\日报"
+    # 一键允许查找整台电脑（所有盘符，仍会跳过 Windows / Program Files /
+    # AppData / 回收站等系统目录）。开启后 timeout 默认放宽到 20 秒。
+    whole_pc: false
+    max_depth: 6            # 目录递归深度
+    max_results: 20         # 最多返回多少个结果
+    timeout: 10             # 单次查找的时间预算（秒）；整机模式默认 20
+    allow_open: true        # 是否允许语音打开查到的文件
+    # 额外排除的目录名（大小写不敏感）；默认已排除 node_modules / AppData /
+    # 系统目录等噪音目录
+    exclude_dirs: []
+
+  # ── 计时提醒（语音："十分钟后提醒我喝水""下午三点提醒我开会"）────────────────
+  # 提醒到点由服务端主动播报；桌宠（声明 features.timer）还会在屏幕上倒计时。
+  timer_reminder:
+    # 同时存在的提醒数量上限
+    max_timers: 5
+
+  # ── 系统音量（语音："音量调到 50%""声音大一点""静音"）────────────────────────
+  # 直接控制电脑默认播放设备的主音量（与任务栏音量滑杆一致），
+  # 需要 pycaw（comtypes 封装 Windows Core Audio，已装入服务端环境：pip install pycaw）。
+  # 工具：set_volume（调到 0~100 / 相对调整）、mute_volume（静音开关）、get_volume（读当前值）。
+  # 行为：写后读回真实值再播报；调到 0 以上时会顺带取消静音。
+  system_volume:
+    step: 10                # "调大一点/小一点"没给具体数值时的默认步进（百分点）
+
+  # ── 桌宠独立音量（语音："你说话声音大一点""音乐声音小一点"）────────────────────
+  # 与 system_volume 不同：调的是**桌宠客户端自己**的两路音量，说话（TTS）与
+  # 音乐（背景音乐）分开。服务端下发 volume 指令 → 桌宠（声明 hello.features.volume）
+  # 本地执行并回报真实值（上行 type=pet_volume）。无配置项，默认步进 10 写在插件里。
+  pet_volume: {}
+
+# 注册到 function_call 的插件清单。
+# 注意：配置合并是"字典深合并、列表整体替换"，所以这里要写全量列表，
+# 否则会覆盖掉 config.yaml 里原有的 change_role / web_search 等。
+Intent:
+  function_call:
+    functions:
+      - change_role
+      - web_search
+      # get_weather 已去除（2026-10-16 用户要求）：和风 Key 401、天气接口用不了，
+      # 问天气改由 web_search 承接（描述见上面 plugins.web_search.description）。
+      # 上游文件 plugins_func/functions/get_weather.py 保留未改，需要时可一行加回来。
+      - get_news_from_newsnow
+      - online_music    # 点歌（本地曲库 + 联网搜索下载），展开为 play_song / stop_music
+      - local_app       # 本机软件调用，展开为 launch_local_app / close_local_app
+      - local_app_control  # 本机软件操作，展开为 app_act / app_task / list_running_apps
+      - file_search     # 本机文件查找，展开为 search_files / open_file
+      - timer_reminder  # 计时提醒，展开为 set_timer / set_reminder / list_timers / cancel_timer
+      - system_volume   # 系统音量，展开为 set_volume / mute_volume / get_volume
+      - pet_volume      # 桌宠自己的音量（说话/音乐分开），展开为 set_pet_volume / get_pet_volume
+      - browser_control # Edge 浏览器操作，展开为 browser_act（独立 profile + CDP）
+      - desktop_task    # 跨软件多步（软件 + Edge + 保存文件），展开为 desktop_task
+
+# 关闭声纹识别。
+# config.yaml 里的 voiceprint 段带着示例 speakers，属于"非空字典"，
+# core/connection.py 的 _initialize_voiceprint() 会因此判定为"该启用"，
+# 但 url 为空导致 provider.enabled=False，于是每次连接都打两条告警：
+#   WARNING - 声纹识别URL未配置，声纹识别将被禁用
+#   WARNING - 声纹识别功能启用但配置不完整
+# 注意：配置采用"递归深合并"（config_loader.merge_configs），
+#       写成 voiceprint: {} 会与基类字典合并、清不掉；必须写成 null
+#       （null 不是 Mapping，才会整体覆盖），使 voiceprint_config 为假值。
+voiceprint: null
+
+# T-14：角色提示词（覆盖 config.yaml 的 prompt）
+# 2026-10-21 重写：原版是"桌面助理 + 台灯/硬件 + 定时提醒复述确认"的旧口径，
+# 用户实测觉得"不像聊天、像客服"，且会背一段不存在的能力清单。
+# 现在改成桌宠人格 + 口语风格，具体说话规则在 data/assistant-prompt.txt。
+prompt: |
+  你是"小智"，住在用户电脑桌面上的一只小桌宠，也是他的语音助手。
+  [说话风格]
+  - 像个熟人聊天：轻松、有温度、偶尔俏皮，但不说废话，也不卖萌过头
+  - 短：默认一两句、30 字上下；能一句说完就不说第二句，不要一二三条地罗列
+  - 口语：常用"好嘞""这就来""弄好了""给你放着""那我先歇着"，
+    不用"正在为您""已为您""很高兴为您服务"这类客服腔
+  - 语气词（嗯、诶、好家伙）一轮最多一个，不要每句开头都加
+  - 说完事情可以带半句关心或追问，但不要每次都反问，也不要重复用户的话
+  [聊天方式]
+  - 先接住用户的话，再给结果；不需要每次都先答一句"好的"
+  - 用户随口聊就顺着聊，别把话题拐到"我还能做什么"
+  - 用户交代事情就直接办，办完一句话讲结果
+  - 做不到或不知道就直说"这个我搞不定"，不编、不绕
+  [你的处境]
+  - 你只活在用户这台电脑上：能开关本机软件、调音量、点歌、找文件、设提醒、联网查资料
+  - 这些能力在用户真的要你做的时候才用，闲聊时不用主动报能力清单
+  - 自我介绍只说"我是小智，住在你桌面上的小桌宠"，不要背功能列表
