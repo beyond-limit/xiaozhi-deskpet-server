@@ -62,6 +62,15 @@ class WakewordDetector:
         logger.info("detector initialized")
         logger.info("detector model root: %s", assets.model_root)
         logger.info("detector keywords file: %s", assets.keywords_file)
+        # 灵敏度参数落日志：排查"唤醒不了/误唤醒"时先看这行，别靠猜配置文件
+        logger.info(
+            "detector params: threshold=%s score=%s max_active_paths=%s trailing_blanks=%s cooldown=%ss",
+            detector_cfg.keywords_threshold,
+            detector_cfg.keywords_score,
+            detector_cfg.max_active_paths,
+            detector_cfg.num_trailing_blanks,
+            detector_cfg.cooldown_seconds,
+        )
 
     def on_detected(self, callback: Callable[[str, str], None]) -> None:
         self.on_detected_callback = callback

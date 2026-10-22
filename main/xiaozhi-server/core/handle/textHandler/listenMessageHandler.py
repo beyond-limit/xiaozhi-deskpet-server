@@ -93,8 +93,15 @@ class ListenTextMessageHandler(TextMessageHandler):
                     conn.dialogue.put(Message(role="assistant", content=call_text))
                     return
 
+                # source=text 表示这是用户在桌宠输入框里打出来的话（不是 ASR 识别结果）：
+                # 这类文本属于正常对话，即使用户打的正好是唤醒词，也直接回答，不要开场白。
+                from_text_input = str(msg_json.get("source") or "") == "text"
+
                 # 识别是否是唤醒词
-                is_wakeup_words = filtered_text in conn.config.get("wakeup_words")
+                is_wakeup_words = (
+                    not from_text_input
+                    and filtered_text in conn.config.get("wakeup_words")
+                )
                 # 是否开启唤醒词回复
                 enable_greeting = conn.config.get("enable_greeting", True)
 
@@ -112,5 +119,11 @@ class ListenTextMessageHandler(TextMessageHandler):
                     conn.just_woken_up = True
                     # 上报纯文字数据（复用ASR上报功能，但不提供音频数据）
                     enqueue_asr_report(conn, original_text, [])
-                    # 否则需要LLM对文字内容进行答复
-                    await startToChat(conn, original_text)
+                    # 文本输入不触发"唤醒词预置回复"（那句'我在这里哦！'）：
+                    # 意图处理里还有一层 checkWakeupWords，用这个一次性标记挡掉。
+                    conn.skip_wakeup_reply = from_text_input
+                    try:
+                        # 否则需要LLM对文字内容进行答复
+                        await startToChat(conn, original_text)
+                    finally:
+                        conn.skip_wakeup_reply = False

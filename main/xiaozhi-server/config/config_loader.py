@@ -20,7 +20,11 @@ def get_project_dir():
 def read_config(config_path):
     with open(config_path, "r", encoding="utf-8") as file:
         config = yaml.safe_load(file)
-    return config
+    # 支持 ${VAR} 环境变量：真实 Key 放仓库根目录的 .env，配置里只留变量名
+    from config.env_expand import expand_env, load_env_near
+
+    load_env_near(get_project_dir())
+    return expand_env(config)
 
 
 async def load_config():

@@ -197,3 +197,9 @@ uploadfile
 main/digital-human/wakeword_runtime/models
 main/digital-human/wakeword_runtime/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01
 sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01.tar.bz2
+
+# ---- 本项目（小智AI桌宠）新增：运行时可再生内容，不进仓库 ----
+# ASR 模型（download_model.py 拉取，约 890 MB）
+main/xiaozhi-server/models/
+# 唤醒词音频缓存（按文本 md5 生成，首次启动自动重建）
+main/xiaozhi-server/config/assets/wakeup_words/

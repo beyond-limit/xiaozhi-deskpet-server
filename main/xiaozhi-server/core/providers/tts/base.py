@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import math
 import uuid
 import queue
@@ -16,6 +17,7 @@ from abc import ABC, abstractmethod
 from config.logger import setup_logging
 from core.utils import opus_encoder_utils
 from core.utils.tts import MarkdownCleaner, convert_percentage_to_range
+from core.utils.spoken_text import SpokenTextFilter
 from core.utils.output_counter import add_device_output
 from core.handle.reportHandle import enqueue_tts_report
 from core.handle.sendAudioHandle import sendAudioMessage
@@ -82,6 +84,8 @@ class TTSProviderBase(ABC):
         # 流式滑动窗口：待匹配的缓存文本
         self._pending_prefix = ""
         self.tts_text_buff = []
+        # 播报过滤器：代码块 / JSON 都可能跨句，状态放在实例上（每轮 FIRST 重置）
+        self._spoken_filter = SpokenTextFilter()
         self.punctuations = (
             "。",
             "？",
@@ -124,9 +128,25 @@ class TTSProviderBase(ABC):
         self.before_stop_play_files.append((file_audio, text))
 
     def to_tts_stream(self, text, opus_handler: Callable[[bytes], None] = None) -> None:
-        # 保留原始文本用于显示/上报
-        original_text = text
-        text = MarkdownCleaner.clean_markdown(text)
+        # 先净化再合成：模型偶尔把 JSON 参数 / 执行步骤 / 代码块写进正文，
+        # 这些内容既不该念出来，也会被当成字幕原样显示在客户端（气泡取的就是这段文本）。
+        spoken = self._spoken_filter.feed(text)
+        if not spoken:
+            logger.bind(tag=TAG).info(
+                f"跳过机器文本（代码/JSON/工具痕迹）: {str(text)[:60]!r}"
+            )
+            return None
+        # [时序诊断] 首句从"用户消息进入 chat"到"送来合成"花了多久
+        _chat_t0 = getattr(self.conn, "_chat_t0", None)
+        if _chat_t0 is not None and not getattr(self, "_first_seg_logged", False):
+            self._first_seg_logged = True
+            logger.bind(tag=TAG).info(
+                f"[时序] 首句进 TTS +{(time.perf_counter() - _chat_t0) * 1000:.0f}ms "
+                f"| {str(spoken)[:24]!r}"
+            )
+        # 保留净化后的文本用于显示/上报（绝不把代码段送去当字幕）
+        original_text = spoken
+        text = MarkdownCleaner.clean_markdown(spoken)
         # 使用正则一次性替换，避免重复遍历和部分匹配问题
         if self._correct_words_pattern:
             text = self._correct_words_pattern.sub(lambda m: self.correct_words[m.group(0)], text)
@@ -194,9 +214,15 @@ class TTSProviderBase(ABC):
                 return None
     
     def to_tts(self, text):
-        # 保留原始文本用于日志/显示
-        original_text = text
-        text = MarkdownCleaner.clean_markdown(text)
+        # 同 to_tts_stream：先把代码/JSON/工具痕迹摘掉，再合成与上报
+        spoken = self._spoken_filter.feed(text)
+        if not spoken:
+            logger.bind(tag=TAG).info(
+                f"跳过机器文本（代码/JSON/工具痕迹）: {str(text)[:60]!r}"
+            )
+            return None
+        original_text = spoken
+        text = MarkdownCleaner.clean_markdown(spoken)
         if self._correct_words_pattern:
             text = self._correct_words_pattern.sub(lambda m: self.correct_words[m.group(0)], text)
         max_repeat_time = 5
@@ -385,7 +411,17 @@ class TTSProviderBase(ABC):
                     self.tts_text_buff = []
                     self.is_first_sentence = True
                     self.tts_audio_first_sentence = True
+                    # 新一轮开始：上一轮若停在未闭合的代码块/JSON 里，别把这一轮也吞了
+                    self._spoken_filter.reset()
+                    self._first_seg_logged = False
                 elif ContentType.TEXT == message.content_type:
+                    # 诊断：模型把工具调用写成文本标记时，看看到底是谁把它推进 TTS 的
+                    if "DSML" in str(message.content_detail):
+                        logger.bind(tag=TAG).warning(
+                            f"[诊断] TTS 收到工具标记文本 | 消息 sid={message.sentence_id} | "
+                            f"conn sid={self.conn.sentence_id} | "
+                            f"{str(message.content_detail)[:60]!r}"
+                        )
                     self.tts_text_buff.append(message.content_detail)
                     segment_text = self._get_segment_text()
                     if segment_text:
@@ -419,7 +455,8 @@ class TTSProviderBase(ABC):
             text = None
             try:
                 try:
-                    item = self.tts_audio_queue.get(timeout=0.1)
+                    # 空闲时别 10 次/秒空转唤醒；0.5s 仍是关闭连接时足够快的响应
+                    item = self.tts_audio_queue.get(timeout=0.5)
                     if len(item) == 4:
                         sentence_type, audio_datas, text, sentence_id = item
                     else:

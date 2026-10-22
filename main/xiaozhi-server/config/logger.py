@@ -108,7 +108,9 @@ def setup_logging(config=None):
             encoding="utf-8",
             enqueue=True,  # 异步安全
             backtrace=True,
-            diagnose=True,
+            # diagnose=True 会在每条异常日志里做源码内省（读文件 + 打印局部变量），
+            # 异常密集时开销明显，且可能把密钥/音频数据写进日志，这里关掉。
+            diagnose=False,
         )
         _logger_initialized = True  # 标记为已初始化
 

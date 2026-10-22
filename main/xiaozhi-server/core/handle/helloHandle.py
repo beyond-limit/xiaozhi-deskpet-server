@@ -60,6 +60,16 @@ async def handleHelloMessage(conn: "ConnectionHandler", msg_json):
 
     await conn.websocket.send(json.dumps(conn.welcome_msg))
 
+    # 设备上线后补播"到点时它不在线"的提醒（等 TTS 就绪，不阻塞 hello 主流程）
+    try:
+        from plugins_func.functions.timer_reminder import deliver_pending_timers
+
+        asyncio.create_task(deliver_pending_timers(conn))
+    except Exception as error:
+        conn.logger.bind(tag=TAG).warning(
+            f"启动离线提醒补播失败 | {type(error).__name__}: {error}"
+        )
+
     # The device waits for the server hello before processing MCP messages.
     if features and features.get("mcp"):
         asyncio.create_task(send_mcp_initialize_message(conn))
@@ -104,8 +114,8 @@ async def checkWakeupWords(conn: "ConnectionHandler", text):
             "text": "我在这里哦！",
         }
 
-    # 获取音频数据
-    opus_packets = await audio_to_data(response.get("file_path"), use_cache=False)
+    # 获取音频数据（唤醒回复文件固定，缓存可省掉每次唤醒的解码 + opus 编码）
+    opus_packets = await audio_to_data(response.get("file_path"), use_cache=True)
     # 播放唤醒词回复
     conn.client_abort = False
 

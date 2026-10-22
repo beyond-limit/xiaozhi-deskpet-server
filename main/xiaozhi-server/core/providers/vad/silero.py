@@ -65,8 +65,9 @@ class VADProvider(VADProviderBase):
 
             client_have_voice = False
             while len(conn.client_audio_buffer) >= 512 * 2:
-                chunk = conn.client_audio_buffer[: 512 * 2]
-                conn.client_audio_buffer = conn.client_audio_buffer[512 * 2 :]
+                chunk = bytes(conn.client_audio_buffer[: 512 * 2])
+                # 原地删除已消费的 1024 字节，避免每次切片都复制整个缓冲区
+                del conn.client_audio_buffer[: 512 * 2]
 
                 audio_int16 = np.frombuffer(chunk, dtype=np.int16)
                 audio_float32 = audio_int16.astype(np.float32) / 32768.0

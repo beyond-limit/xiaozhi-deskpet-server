@@ -64,15 +64,29 @@ async def main():
     # 添加 stdin 监控任务
     stdin_task = asyncio.create_task(monitor_stdin())
 
-    # 启动全局GC管理器（5分钟清理一次）
-    gc_manager = get_gc_manager(interval_seconds=300)
+    # 启动全局GC管理器（30分钟清理一次；gen2 全量回收在堆较大时有明显停顿，
+    # 桌宠场景内存增长很慢，5 分钟一次纯属浪费）
+    gc_manager = get_gc_manager(interval_seconds=1800)
     await gc_manager.start()
 
     # 启动 WebSocket 服务器
     ws_server = WebSocketServer(config)
     ws_task = asyncio.create_task(ws_server.start())
+
+    # 恢复上次未到点的提醒（服务端重启不丢）；到点但设备离线时会自动进补播队列
+    try:
+        from plugins_func.functions.timer_reminder import load_persisted_timers
+
+        restored = load_persisted_timers(config, ws_server)
+        if restored:
+            logger.bind(tag=TAG).info(f"从 data/timers.json 恢复了 {restored} 条提醒")
+    except Exception as error:
+        logger.bind(tag=TAG).error(
+            f"恢复已保存提醒失败 | {type(error).__name__}: {error}"
+        )
+
     # 启动 Simple http 服务器
-    ota_server = SimpleHttpServer(config)
+    ota_server = SimpleHttpServer(config, ws_server)
     ota_task = asyncio.create_task(ota_server.start())
 
     read_config_from_api = config.get("read_config_from_api", False)

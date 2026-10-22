@@ -324,6 +324,27 @@ async def audio_to_data(
     return result
 
 
+def _wav_pcm_if_compatible(audio_bytes, sample_rate):
+    """wav 已是「单声道 / 16bit / 目标采样率」时直接返回 PCM，否则返回 None。
+
+    pydub 的 AudioSegment.from_file 每次都会 fork 一个 ffmpeg 子进程（Windows 上
+    50~200ms CPU）。SapiLocal 等本地 TTS 输出的 24k/16bit/单声道 wav 正好是设备
+    需要的格式，这里命中就直接取 PCM，省掉进程创建与一次磁盘往返。
+    格式不符（双声道 / 8bit / 需重采样）时返回 None，交给 pydub 处理。
+    """
+    try:
+        with wave.open(BytesIO(audio_bytes)) as reader:
+            if (
+                reader.getnchannels() != 1
+                or reader.getsampwidth() != 2
+                or reader.getframerate() != int(sample_rate)
+            ):
+                return None
+            return reader.readframes(reader.getnframes())
+    except Exception:
+        return None
+
+
 def audio_bytes_to_data_stream(
     audio_bytes, file_type, is_opus, callback: Callable[[Any], Any], sample_rate=16000, opus_encoder=None
 ) -> None:
@@ -333,14 +354,22 @@ def audio_bytes_to_data_stream(
     if file_type == "p3":
         # 直接用p3解码
         return p3.decode_opus_from_bytes_stream(audio_bytes, callback)
-    else:
-        # 其他格式用pydub
-        audio = AudioSegment.from_file(
-            BytesIO(audio_bytes), format=file_type, parameters=["-nostdin"]
-        )
-        audio = audio.set_channels(1).set_frame_rate(sample_rate).set_sample_width(2)
-        raw_data = audio.raw_data
-        pcm_to_data_stream(raw_data, is_opus, callback, sample_rate, opus_encoder)
+
+    if str(file_type).lower() == "wav":
+        raw_data = _wav_pcm_if_compatible(audio_bytes, sample_rate)
+        if raw_data is not None:
+            pcm_to_data_stream(
+                raw_data, is_opus, callback, sample_rate, opus_encoder
+            )
+            return
+
+    # 其他格式（或格式不符需要重采样）用pydub
+    audio = AudioSegment.from_file(
+        BytesIO(audio_bytes), format=file_type, parameters=["-nostdin"]
+    )
+    audio = audio.set_channels(1).set_frame_rate(sample_rate).set_sample_width(2)
+    raw_data = audio.raw_data
+    pcm_to_data_stream(raw_data, is_opus, callback, sample_rate, opus_encoder)
 
 
 def pcm_to_data_stream(raw_data, is_opus=True, callback: Callable[[Any], Any] = None, sample_rate=16000, opus_encoder=None):

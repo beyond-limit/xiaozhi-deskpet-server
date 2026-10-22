@@ -10,6 +10,7 @@ pyyml==0.0.2
 silero_vad==6.2.1
 opuslib_next==1.1.5
 pydub==0.25.1
+sounddevice>=0.4.6  # 方案B：服务端音乐播放（默认输出设备）
 funasr==1.2.7
 openai==2.8.1
 google-generativeai==0.8.5
@@ -37,6 +38,11 @@ markitdown==0.1.3
 mcp-proxy==0.10.0
 PyJWT==2.10.1
 psutil==7.1.3
+# --------- 本项目新增（桌宠/本机操作相关）
+imageio-ffmpeg>=0.5.1  # 自带 ffmpeg 二进制，免装系统 ffmpeg（见 README 第 2 节）
+pycaw>=20240210        # Windows 主音量（comtypes 会一起装上）
+pywin32>=306           # SAPI 本地 TTS、Office COM
+yt-dlp>=2024.8.6       # 点歌的 B 站兜底音源
 portalocker==3.2.0  # 暂留 3.x：4.x 与 qdrant-client<1.20 的 portalocker<4.0 约束冲突 (PR #3360)
 Jinja2==3.1.6
 vosk==0.3.45

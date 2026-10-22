@@ -93,7 +93,18 @@ class ToolManager:
 
             # 执行工具
             self.logger.info(f"执行工具: {tool_name}，参数: {arguments}")
-            result = await executor.execute(self.conn, tool_name, arguments)
+            # 任务保护：工具执行期间标记"任务进行中"，服务端的空闲休眠判定会跳过这段静默；
+            # 无论成功、失败还是超时，结束都要把计数还回去（finally 保证）。
+            conn = getattr(self, "conn", None)
+            begin_task = getattr(conn, "begin_task", None)
+            end_task = getattr(conn, "end_task", None)
+            if begin_task:
+                begin_task()
+            try:
+                result = await executor.execute(self.conn, tool_name, arguments)
+            finally:
+                if end_task:
+                    end_task()
             self.logger.debug(f"工具执行结果: {result}")
             return result
 

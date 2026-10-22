@@ -13,7 +13,6 @@ from .server_mcp import ServerMCPExecutor
 from .device_iot import DeviceIoTExecutor
 from .device_mcp import DeviceMCPExecutor
 from .mcp_endpoint import MCPEndpointExecutor
-from core.handle.sendAudioHandle import send_display_message
 
 
 class UnifiedToolHandler:
@@ -166,13 +165,9 @@ class UnifiedToolHandler:
                         response="无法解析函数参数",
                     )
 
+            # 调用过程只进日志，不再下发 "% 工具名" 之类的中转字幕：
+            # 用户要听的是结果，气泡里冒出 "% play_song" 会被当成对话内容。
             self.logger.debug(f"调用函数: {function_name}, 参数: {arguments}")
-
-            # 发送工具调用显示消息到设备
-            try:
-                await send_display_message(self.conn, f"% {function_name}")
-            except Exception as e:
-                self.logger.warning(f"发送工具调用显示消息失败: {e}")
 
             # 执行工具调用
             result = await self.tool_manager.execute_tool(function_name, arguments)

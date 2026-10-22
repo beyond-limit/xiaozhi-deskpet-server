@@ -93,7 +93,7 @@ class Dialogue:
 
     def get_llm_dialogue_with_memory(
             self, memory_str: str = None, voiceprint_config: dict = None,
-            current_speaker: str = None,
+            current_speaker: str = None, extra_system: str = None,
     ) -> List[Dict[str, str]]:
         # 构建对话
         dialogue = []
@@ -144,6 +144,10 @@ class Dialogue:
                     full_prompt += speakers_info
             except:
                 pass
+
+            # 本轮实时状态（如"当前提醒清单"）：模型看不到服务端内存，靠它而不是靠猜
+            if extra_system:
+                full_prompt = f"{full_prompt}\n{extra_system}"
 
             dialogue.append({"role": "system", "content": full_prompt})
 

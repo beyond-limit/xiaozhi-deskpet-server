@@ -107,6 +107,11 @@ async def no_voice_close_connect(conn: "ConnectionHandler", have_voice):
     if have_voice:
         conn.last_activity_time = time.time() * 1000
         return
+    # 任务（工具调用）没结束时不结束对话：执行任务时用户本来就不会一直说话，
+    # 若按空闲处理，任务做到一半桌宠就念结束语、回待机了。
+    task_in_progress = getattr(conn, "task_in_progress", None)
+    if task_in_progress and task_in_progress():
+        return
     # 只有在已经初始化过时间戳的情况下才进行超时检查
     if conn.last_activity_time > 0.0:
         no_voice_time = time.time() * 1000 - conn.last_activity_time

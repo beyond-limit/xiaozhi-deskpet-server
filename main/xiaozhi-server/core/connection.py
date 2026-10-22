@@ -45,6 +45,7 @@ from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import textUtils
+from core.utils.spoken_text import sanitize_spoken_text, strip_spoken_text
 
 
 TAG = __name__
@@ -74,6 +75,78 @@ DIRECT_ANSWER_TOOL = {
         },
     },
 }
+
+# 有的模型（实测 DeepSeek）偶尔不走标准 tool_calls 字段，而是把工具调用写成文本标记塞进 content：
+#   <｜｜DSML｜｜ invoke name="launch_local_app">
+#   <｜｜DSML｜｜ parameter name="app_name" string="true">记事本</｜｜DSML｜｜ parameter>
+#   </｜｜DSML｜｜ invoke>
+# 不处理的话：既不会执行工具，又会把这一堆标记当回答念给用户听
+# （实测："5秒后关闭记事本"念出了一串 <｜｜DSML｜｜...）。
+# 这里做两层兜底：流式阶段按前缀提前拦下（不让它进 TTS），收尾阶段再解析成标准调用。
+_DSML_PREFIX = "<｜｜DSML｜｜"
+# 标记里的竖线可能是全角 ｜ / 半角 | / 数量不对，还可能夹着不可见字符，
+# 所以一概用 \W（非字母数字）去接，不去猜具体是哪个字符。
+# 开始标记的替换**不带右尖括号**：invoke/parameter 后面还跟着 name="..." 属性，
+# 原来的写法会把属性挤到尖括号外面（实测：规范化后变成 <DSML-invoke> name="x">，
+# 结果后面的正则一个都匹配不上）。结束标记反过来，要把 \s*> 一起吃进去。
+#
+# 第二个分支（竖线 + DSML）不能少：流式分块时"<"会单独成块，
+# 后面几块长这样 "｜｜DSML｜｜"，光看 "<...DSML" 会漏（实测就是这么漏的）。
+_DSML_MARK_RE = re.compile(r"<(?!/)\W{0,4}DSML|[｜|]{1,3}\s*DSML")
+_DSML_TOKEN_RE = re.compile(r"<(?!/)\W{0,4}DSML\W{0,4}([A-Za-z]+)")
+_DSML_END_TOKEN_RE = re.compile(r"</\W{0,4}DSML\W{0,4}([A-Za-z]+)\s*>")
+
+
+def _normalize_dsml(text: str) -> str:
+    """把各种写法的 DSML 标记统一成 ``<DSML-invoke ...>`` 便于用正则解析。"""
+    text = _DSML_END_TOKEN_RE.sub(r"</DSML-\1>", text)
+    return _DSML_TOKEN_RE.sub(r"<DSML-\1", text)
+
+
+_DSML_INVOKE_RE = re.compile(
+    r"<DSML-invoke\s+name=\"([^\"]+)\"[^>]*>(.*?)</DSML-invoke>",
+    re.S,
+)
+_DSML_PARAM_RE = re.compile(
+    r"<DSML-parameter\s+name=\"([^\"]+)\"[^>]*>(.*?)</DSML-parameter>",
+    re.S,
+)
+
+
+def _known_function_names(functions) -> set:
+    """当前这轮可用工具名（用来挡掉模型自己编的名字，实测见过 ``set_alarm``）。"""
+    names = set()
+    for item in functions or []:
+        if isinstance(item, dict):
+            name = (item.get("function") or {}).get("name")
+            if name:
+                names.add(name)
+    return names
+
+
+def _extract_dsml_tool_calls(text: str) -> list:
+    """把 DSML 文本标记解析成标准工具调用；没有或解析不出来时返回空列表。"""
+    if not text or not _DSML_MARK_RE.search(text):
+        return []
+    normalized = _normalize_dsml(text)
+    calls = []
+    for match in _DSML_INVOKE_RE.finditer(normalized):
+        name = (match.group(1) or "").strip()
+        if not name:
+            continue
+        arguments = {}
+        for param in _DSML_PARAM_RE.finditer(match.group(2)):
+            key = (param.group(1) or "").strip()
+            if key:
+                arguments[key] = param.group(2).strip()
+        calls.append(
+            {
+                "id": str(uuid.uuid4().hex),
+                "name": name,
+                "arguments": json.dumps(arguments, ensure_ascii=False),
+            }
+        )
+    return calls
 
 
 class ConnectionHandler:
@@ -114,6 +187,8 @@ class ConnectionHandler:
 
         # 客户端状态相关
         self.client_abort = False
+        # 本轮有没有真正念出过内容（用来兜底"什么都没说"的情况）
+        self.spoken_this_turn = False
         self.client_is_speaking = False
         self.client_listen_mode = "auto"
         self.client_aec = False  # 是否启用了服务端AEC
@@ -178,6 +253,11 @@ class ConnectionHandler:
 
         # 是否在聊天结束后关闭连接
         self.close_after_chat = False
+        # 正在执行的任务数（工具调用）：任务没结束，就不按"用户没说话"休眠
+        self.active_tasks = 0
+        self.task_busy_since = 0.0
+        # 任务忙碌保护上限（秒）：工具卡死时不能把连接永久挂住，超过就恢复正常超时
+        self.task_busy_max = 600.0
         self.load_function_plugin = False
         self.intent_type = "nointent"
 
@@ -1055,14 +1135,26 @@ class ConnectionHandler:
     def chat(self, query, depth=0):
         # 保存当前任务的sentence_id到局部变量，避免被新任务覆盖
         current_sentence_id = None
+        # [时序诊断] 本轮起点：用于分段统计"LLM 首块 / 首句进 TTS"各花多久
+        _turn_t0 = time.perf_counter()
+        self._chat_t0 = _turn_t0
 
         if query is not None:
             self.logger.bind(tag=TAG).info(f"大模型收到用户消息: {query}")
+            # 持续记录模式下，把用户这句话追加进记事本（失败不影响对话主流程）
+            if depth == 0:
+                try:
+                    from plugins_func.functions.local_app import capture_user_text
+
+                    capture_user_text(self, query)
+                except Exception as error:
+                    self.logger.bind(tag=TAG).warning(f"记事本记录失败: {error}")
 
         # 为最顶层时新建会话ID和发送FIRST请求
         if depth == 0:
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
+            self.spoken_this_turn = False  # 新一轮开始，重新统计"有没有念出过内容"
             self.dialogue.put(Message(role="user", content=query))
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
@@ -1126,12 +1218,26 @@ class ConnectionHandler:
                 self.system_introduced_speakers.add(cs)
                 speaker_for_system = cs
 
+            # 实时提醒清单：模型看不到服务端内存，不注入就只能拿历史当现状
+            # （典型症状：同名定时任务执行完后再设一次，它答"刚才已经设置过了"）
+            extra_system = ""
+            if depth == 0:
+                try:
+                    from plugins_func.functions.timer_reminder import prompt_state
+
+                    extra_system = prompt_state()
+                except Exception as error:
+                    self.logger.bind(tag=TAG).warning(f"读取提醒状态失败: {error}")
+
             if self.intent_type == "function_call" and functions is not None:
                 # 使用支持functions的streaming接口
                 llm_responses = self.llm.response_with_functions(
                     self.session_id,
                     self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {}), speaker_for_system
+                        memory_str,
+                        self.config.get("voiceprint", {}),
+                        speaker_for_system,
+                        extra_system=extra_system,
                     ),
                     functions=functions,
                 )
@@ -1139,7 +1245,10 @@ class ConnectionHandler:
                 llm_responses = self.llm.response(
                     self.session_id,
                     self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {}), speaker_for_system
+                        memory_str,
+                        self.config.get("voiceprint", {}),
+                        speaker_for_system,
+                        extra_system=extra_system,
                     ),
                 )
         except Exception as e:
@@ -1147,6 +1256,8 @@ class ConnectionHandler:
             return None
 
         # 处理流式响应
+        dsml_probe_logged = False  # 诊断用：首次撞见疑似标记字符时记一条日志
+        _first_text_logged = False  # [时序诊断] 首个可播文本块只记一次
         tool_call_flag = False
         # 支持多个并行工具调用 - 使用列表存储
         tool_calls_list = []  # 格式: [{"id": "", "name": "", "arguments": ""}]
@@ -1164,9 +1275,31 @@ class ConnectionHandler:
                     if content is not None and len(content) > 0:
                         content_arguments += content
 
-                    if not tool_call_flag and content_arguments.startswith("<tool_call>"):
-                        # print("content_arguments", content_arguments)
-                        tool_call_flag = True
+                    if (
+                        not dsml_probe_logged
+                        and content_arguments
+                        and ("DSML" in content_arguments or "\uff5c" in content_arguments)
+                    ):
+                        dsml_probe_logged = True
+                        self.logger.bind(tag=TAG).warning(
+                            f"检测到疑似工具标记 | flag={tool_call_flag} | "
+                            f"码点={[hex(ord(c)) for c in content_arguments[:16]]} | "
+                            f"{content_arguments[:120]!r}"
+                        )
+
+                    # 文本形式的工具调用：提前置位，避免把标记当回答推进 TTS。
+                    # 判定要宽容：模型常在标记前先吐换行/不可见字符（实测光靠
+                    # startswith("<") 拦不住，整段标记被念了出来），所以除了"以 < 开头"，
+                    # 再按特征串搜一遍。
+                    # 万一是普通回答：收尾处 bHasError 分支会把它补播出来，不至于丢内容。
+                    if not tool_call_flag:
+                        probe = content_arguments.lstrip()
+                        if (
+                            probe.startswith("<")
+                            or _DSML_MARK_RE.search(content_arguments)
+                        ):
+                            # print("content_arguments", content_arguments)
+                            tool_call_flag = True
 
                     if tools_call is not None and len(tools_call) > 0:
                         tool_call_flag = True
@@ -1180,6 +1313,12 @@ class ConnectionHandler:
                             da_text = self._extract_direct_answer_response(tc["arguments"])
                             sent_len = tc.get("_da_sent", 0)
                             if da_text and len(da_text) > sent_len:
+                                # 模型有时把"真正的工具调用标记"塞进 direct_answer 的 response 参数
+                                # （实测：response 里是 <｜｜DSML｜｜ invoke name=set_alarm>…），
+                                # 这些碎片绝不能进 TTS —— 收尾时会把它们解析成工具调用去执行。
+                                if _DSML_MARK_RE.search(da_text):
+                                    tc["_da_sent"] = len(da_text)
+                                    continue
                                 safe_end = max(sent_len, len(da_text) - _DA_STREAM_BUFFER)
                                 if safe_end > sent_len:
                                     new_part = da_text[sent_len:safe_end]
@@ -1208,8 +1347,40 @@ class ConnectionHandler:
                     emotion_flag = False
 
                 if content is not None and len(content) > 0:
-                    if not tool_call_flag:
+                    # 最后一道闸：真到要念的时候再看一眼有没有工具调用标记。
+                    # 这里不只看累积内容，也看当前这一块本身（工具等分支下
+                    # content_arguments 可能根本没累积，只看累积会漏），
+                    # 保证"<｜｜DSML｜｜…"不会被念给用户。
+                    if not tool_call_flag and (
+                        _DSML_MARK_RE.search(content)
+                        or _DSML_MARK_RE.search(content_arguments)
+                    ):
+                        tool_call_flag = True
+                        self.logger.bind(tag=TAG).warning(
+                            f"TTS 前拦下工具标记 | 码点={[hex(ord(c)) for c in str(content)[:12]]} | "
+                            f"{str(content)[:80]!r}"
+                        )
+                    # 分块时"<"会单独成块先到（后面几块才是 ｜｜DSML｜｜）：这种裸碎片
+                    # 既没意义、又会让 SAPI 把它当 XML 解析失败（整句报错），直接丢掉。
+                    orphan_markup = str(content).strip() in (
+                        "<",
+                        ">",
+                        "</",
+                        "<|",
+                        "<｜",
+                        "|",
+                        "｜",
+                        "||",
+                        "｜｜",
+                    )
+                    if not tool_call_flag and not orphan_markup:
+                        if not _first_text_logged:
+                            _first_text_logged = True
+                            self.logger.bind(tag=TAG).info(
+                                f"[时序] 首个可播文本块 +{(time.perf_counter() - _turn_t0) * 1000:.0f}ms"
+                            )
                         response_message.append(content)
+                        self.spoken_this_turn = True
                         self.tts.tts_text_queue.put(
                             TTSMessageDTO(
                                 sentence_id=current_sentence_id,
@@ -1242,30 +1413,86 @@ class ConnectionHandler:
             bHasError = False
             # 处理基于文本的工具调用格式
             if len(tool_calls_list) == 0 and content_arguments:
-                a = extract_json_from_string(content_arguments)
-                if a is not None:
-                    try:
-                        content_arguments_json = json.loads(a)
-                        tool_calls_list.append(
-                            {
-                                "id": str(uuid.uuid4().hex),
-                                "name": content_arguments_json["name"],
-                                "arguments": json.dumps(
-                                    content_arguments_json["arguments"],
-                                    ensure_ascii=False,
-                                ),
-                            }
-                        )
-                    except Exception as e:
-                        bHasError = True
-                        response_message.append(a)
-                else:
-                    bHasError = True
-                    response_message.append(content_arguments)
-                if bHasError:
-                    self.logger.bind(tag=TAG).error(
-                        f"function call error: {content_arguments}"
+                dsml_calls = _extract_dsml_tool_calls(content_arguments)
+                if dsml_calls:
+                    # 标记本身不是回答，丢掉它，别写进历史也别播报
+                    response_message.clear()
+                    known = _known_function_names(functions)
+                    usable = (
+                        [call for call in dsml_calls if call["name"] in known]
+                        if known
+                        else dsml_calls
                     )
+                    unknown = [
+                        call["name"] for call in dsml_calls if call not in usable
+                    ]
+                    if unknown:
+                        self.logger.bind(tag=TAG).warning(
+                            f"模型写出的工具不存在，已忽略 | {unknown}"
+                        )
+                    if usable:
+                        tool_calls_list.extend(usable)
+                        self.logger.bind(tag=TAG).warning(
+                            f"模型把工具调用写成了文本标记(DSML)，已按调用处理 | "
+                            f"{[call['name'] for call in usable]}"
+                        )
+                    else:
+                        # 全是编出来的工具名：说一句反馈，不能静默（用户会以为没听见）
+                        bHasError = True
+                        self.spoken_this_turn = True
+                        self.tts.tts_one_sentence(
+                            self,
+                            ContentType.TEXT,
+                            content_detail="抱歉，这个我暂时做不了，你换个说法试试。",
+                        )
+                else:
+                    if _DSML_PREFIX in content_arguments:
+                        # 有标记但没解析出来：把累积文本原样记下来，方便定位
+                        self.logger.bind(tag=TAG).warning(
+                            f"DSML 标记解析失败，按文本处理 | {content_arguments[:240]!r}"
+                        )
+                    a = extract_json_from_string(content_arguments)
+                    if a is not None:
+                        try:
+                            content_arguments_json = json.loads(a)
+                            tool_calls_list.append(
+                                {
+                                    "id": str(uuid.uuid4().hex),
+                                    "name": content_arguments_json["name"],
+                                    "arguments": json.dumps(
+                                        content_arguments_json["arguments"],
+                                        ensure_ascii=False,
+                                    ),
+                                }
+                            )
+                        except Exception as e:
+                            bHasError = True
+                            response_message.append(a)
+                    else:
+                        bHasError = True
+                        response_message.append(content_arguments)
+                    if bHasError:
+                        self.logger.bind(tag=TAG).error(
+                            f"function call error: {content_arguments}"
+                        )
+                        if _DSML_MARK_RE.search(content_arguments):
+                            # 是工具调用标记但没解析出来：宁可这一轮什么都不说，
+                            # 也绝不能把 "<｜｜DSML｜｜…" 念给用户听
+                            response_message.clear()
+                            self.logger.bind(tag=TAG).error(
+                                f"工具调用标记解析失败，已丢弃（不播报） | "
+                                f"{content_arguments[:160]!r}"
+                            )
+                        else:
+                            # 这段内容是被"疑似工具调用"拦下来的（以 < 开头），结果既不是
+                            # 文本工具调用也不是标准 JSON —— 那它就是普通回答，补播一次，
+                            # 否则流式阶段没推 TTS、收尾这里也不推，用户会完全听不到。
+                            rescued = "".join(response_message).strip()
+                            if rescued:
+                                self.spoken_this_turn = True
+                                self.tts.tts_one_sentence(
+                                    self, ContentType.TEXT, content_detail=rescued
+                                )
 
             if not bHasError and len(tool_calls_list) > 0:
                 # 处理 direct_answer 虚拟工具
@@ -1276,30 +1503,81 @@ class ConnectionHandler:
                     self.logger.bind(tag=TAG).debug(
                         f"模型选择 direct_answer，流式已播报，写入对话历史"
                     )
+                    da_texts = []
                     for tc in direct_answer_calls:
                         da_response = self._extract_direct_answer_response(tc.get("arguments", "{}"))
+                        da_texts.append(da_response)
+                        if da_response and _DSML_MARK_RE.search(da_response):
+                            # 模型把真正的工具调用标记塞进了 direct_answer 的 response 里
+                            # （实测：response 就是 "<｜｜DSML｜｜ invoke name=set_alarm>…"）。
+                            # 这既不是回答、也不能念，把它解析成工具调用交给下面的流程执行；
+                            # 解析不出来（或工具名是编的）就整段丢掉，绝不能念出来。
+                            inner_calls = _extract_dsml_tool_calls(da_response)
+                            known = _known_function_names(functions)
+                            usable = (
+                                [call for call in inner_calls if call["name"] in known]
+                                if known
+                                else inner_calls
+                            )
+                            if usable:
+                                real_tool_calls.extend(usable)
+                                self.logger.bind(tag=TAG).warning(
+                                    f"direct_answer 里裹着工具调用标记，已改按工具执行 | "
+                                    f"{[call['name'] for call in usable]}"
+                                )
+                            else:
+                                self.logger.bind(tag=TAG).error(
+                                    f"direct_answer 里的标记无法解析成有效工具，已丢弃 | "
+                                    f"{da_response[:120]!r}"
+                                )
+                            continue
                         if da_response:
-                            # 刷新流式缓冲区中未发送的部分
+                            # 刷新流式缓冲区中未发送的部分（同样是"人话"过滤后才播）
                             sent_len = tc.get("_da_sent", 0)
-                            remaining = da_response[sent_len:]
+                            remaining = self._clean_response_garbage(da_response[sent_len:])
+                            remaining = sanitize_spoken_text(remaining)
                             if remaining:
-                                remaining = self._clean_response_garbage(remaining)
-                                if remaining:
-                                    self.tts.tts_text_queue.put(
-                                        TTSMessageDTO(
-                                            sentence_id=current_sentence_id,
-                                            sentence_type=SentenceType.MIDDLE,
-                                            content_type=ContentType.TEXT,
-                                            content_detail=remaining,
-                                        )
+                                self.spoken_this_turn = True
+                                self.tts.tts_text_queue.put(
+                                    TTSMessageDTO(
+                                        sentence_id=current_sentence_id,
+                                        sentence_type=SentenceType.MIDDLE,
+                                        content_type=ContentType.TEXT,
+                                        content_detail=remaining,
                                     )
-                            # 写入对话历史
-                            da_response = self._clean_response_garbage(da_response)
-                            self.tts.store_tts_text(current_sentence_id, da_response)
-                            self.dialogue.put(Message(role="assistant", content=da_response))
+                                )
+                            # 写入对话历史（不留代码段，免得模型下轮照着写）
+                            da_clean = sanitize_spoken_text(
+                                self._clean_response_garbage(da_response)
+                            )
+                            if da_clean:
+                                self.tts.store_tts_text(current_sentence_id, da_clean)
+                                self.dialogue.put(
+                                    Message(role="assistant", content=da_clean)
+                                )
 
                     if not real_tool_calls:
                         if depth == 0:
+                            # 模型调了 direct_answer 但没吐出内容（参数被截断/为空）时，
+                            # 以前是彻底静默（用户只看到"状态闪一下"），这里补一句兜底
+                            if not any(
+                                text
+                                for text in da_texts
+                                if text and not _DSML_MARK_RE.search(text)
+                            ):
+                                self.logger.bind(tag=TAG).warning(
+                                    f"direct_answer 参数为空（或只剩工具标记），按空响应兜底 | "
+                                    f"arguments={[tc.get('arguments', '')[:80] for tc in direct_answer_calls]}"
+                                )
+                                self.spoken_this_turn = True
+                                self.tts.tts_text_queue.put(
+                                    TTSMessageDTO(
+                                        sentence_id=current_sentence_id,
+                                        sentence_type=SentenceType.MIDDLE,
+                                        content_type=ContentType.TEXT,
+                                        content_detail="抱歉，我没听清，你再说一次好吗？",
+                                    )
+                                )
                             self.tts.tts_text_queue.put(
                                 TTSMessageDTO(
                                     sentence_id=current_sentence_id,
@@ -1320,8 +1598,13 @@ class ConnectionHandler:
                 streamed_text = ""
                 if len(response_message) > 0:
                     streamed_text = "".join(response_message)
-                    self.tts.store_tts_text(current_sentence_id, streamed_text)
-                    self.dialogue.put(Message(role="assistant", content=streamed_text))
+                    # 历史里也只留"人话"：模型看到自己上一轮写过代码段，下一轮就会学。
+                    streamed_clean = sanitize_spoken_text(streamed_text)
+                    if streamed_clean:
+                        self.tts.store_tts_text(current_sentence_id, streamed_clean)
+                        self.dialogue.put(
+                            Message(role="assistant", content=streamed_clean)
+                        )
                 response_message.clear()
 
                 # 收集所有工具调用的 Future
@@ -1371,11 +1654,39 @@ class ConnectionHandler:
                 if tool_results:
                     self._handle_function_result(tool_results, depth=depth, streamed_text=streamed_text)
 
-        # 存储对话内容
+        # 空响应兜底：这一轮**一个字都没念出去**时（模型把工具调用写成文本标记被丢弃、
+        # 工具参数被截断、流被静默中断…），以前是"状态闪一下但什么也不说"，
+        # 用户完全不知道发生了什么。这里必须给一句反馈，并把细节写进日志方便定位。
+        # 注意：用户主动打断（client_abort）时不兜底 —— 那是正常的"别说了"。
+        # 注意2：有些工具（点歌等）是插件自己往 TTS 队列推的播报，不会经过上面这些
+        # spoken_this_turn 标记点。这里再查一次本轮 sentence_id 有没有落过文本，
+        # 落过就说明已经念过话了 —— 否则会出现"播完歌又跟一句没反应过来"（实测）。
+        already_spoken = self.spoken_this_turn or bool(
+            self.tts.get_tts_text(current_sentence_id)
+        )
+        if (
+            depth == 0
+            and not self.client_abort
+            and query
+            and not already_spoken
+            and len(response_message) == 0
+        ):
+            self.logger.bind(tag=TAG).warning(
+                f"LLM 空响应 | 工具标记={tool_call_flag} 工具数={len(tool_calls_list)} "
+                f"| 累积文本={content_arguments[:120]!r} | abort={self.client_abort} | 提问={query!r}"
+            )
+            # 流式阶段没有内容，所以这里要显式推 TTS（光塞 response_message 是不会出声的）
+            fallback = "抱歉，我这边没反应过来，你再说一次好吗？"
+            self.tts.tts_one_sentence(self, ContentType.TEXT, content_detail=fallback)
+            self.tts.store_tts_text(current_sentence_id, fallback)
+            self.dialogue.put(Message(role="assistant", content=fallback))
+
+        # 存储对话内容（字幕与历史都只留"人话"，代码段/JSON 不落盘）
         if len(response_message) > 0:
-            text_buff = "".join(response_message)
-            self.tts.store_tts_text(current_sentence_id, text_buff)
-            self.dialogue.put(Message(role="assistant", content=text_buff))
+            text_buff = sanitize_spoken_text("".join(response_message))
+            if text_buff:
+                self.tts.store_tts_text(current_sentence_id, text_buff)
+                self.dialogue.put(Message(role="assistant", content=text_buff))
 
         if depth == 0:
             self.tts.tts_text_queue.put(
@@ -1397,6 +1708,8 @@ class ConnectionHandler:
     def _handle_function_result(self, tool_results, depth, streamed_text=""):
         need_llm_tools = []
         record_tools = []
+        # 直接回复类工具（RESPONSE / NOTFOUND / ERROR）：先播报，稍后统一按"三段式"写进历史
+        reply_tools = []
 
         for result, tool_call_data in tool_results:
             if result.action in [
@@ -1404,21 +1717,74 @@ class ConnectionHandler:
                 Action.NOTFOUND,
                 Action.ERROR,
             ]:
-                text = result.response if result.response else result.result
-                if streamed_text and text in streamed_text:
+                raw_text = result.response if result.response else result.result
+                # 工具回复也要过一遍"人话过滤"：插件可能把执行记录、完整路径、
+                # 异常原文塞进回复，这些不该念出来，更不该显示在字幕里。
+                text = sanitize_spoken_text(raw_text or "")
+                if not text:
+                    # 整段都是机器文本：至少告诉用户"执行过了"
+                    text = "好了"
+                if streamed_text and (
+                    text in streamed_text or (raw_text and raw_text in streamed_text)
+                ):
+                    # 这段文本流式阶段已经念过了，这里只是不重复播报 —— 但"本轮念过话"
+                    # 这个事实必须记上，否则末尾的空响应兜底会再多念一句。
+                    self.spoken_this_turn = True
                     self.logger.bind(tag=TAG).debug(
                         f"Skipping duplicate TTS for tool {tool_call_data['name']}, already streamed"
                     )
                 else:
+                    self.spoken_this_turn = True
                     self.tts.tts_one_sentence(self, ContentType.TEXT, content_detail=text)
                     self.tts.store_tts_text(self.sentence_id, text)
-                self.dialogue.put(Message(role="assistant", content=text))
+                reply_tools.append((result, tool_call_data, text))
             elif result.action == Action.REQLLM:
                 need_llm_tools.append((result, tool_call_data))
             elif result.action == Action.RECORD:
                 record_tools.append((result, tool_call_data))
             else:
                 pass
+
+        # 直接回复类工具同样写成标准三段式：assistant(tool_calls) → tool(执行结果) → assistant(回复文本)。
+        # 之前只写一条 assistant 文本，模型从历史里看到的是"这类请求直接回答就行"，
+        # 连续几次之后就会只口头答应、不再真正调用工具（实测：连设提醒时第 4/5 次漏调，
+        # 表现为"说了后没设上/到点不响"）。补上 tool_calls 记录后，历史里始终有"我调过工具"的正样本。
+        if reply_tools:
+            for _, tool_call_data, _ in reply_tools:
+                if not tool_call_data.get("id"):
+                    tool_call_data["id"] = str(uuid.uuid4())
+            self.dialogue.put(
+                Message(
+                    role="assistant",
+                    tool_calls=[
+                        {
+                            "id": tool_call_data["id"],
+                            "function": {
+                                "arguments": (
+                                    "{}"
+                                    if tool_call_data["arguments"] == ""
+                                    else tool_call_data["arguments"]
+                                ),
+                                "name": tool_call_data["name"],
+                            },
+                            "type": "function",
+                            "index": idx,
+                        }
+                        for idx, (_, tool_call_data, _) in enumerate(reply_tools)
+                    ],
+                )
+            )
+            for result, tool_call_data, text in reply_tools:
+                self.dialogue.put(
+                    Message(
+                        role="tool",
+                        tool_call_id=tool_call_data["id"],
+                        content=result.result or "已执行",
+                    )
+                )
+            merged_text = "，".join(text for _, _, text in reply_tools if text)
+            if merged_text:
+                self.dialogue.put(Message(role="assistant", content=merged_text))
 
         # Action.RECORD：写入完整工具调用链（assistant(tool_calls) → tool(result) → assistant(response)）
         # 模型从历史中学到工具调用模式，不额外调用LLM
@@ -1465,6 +1831,9 @@ class ConnectionHandler:
                     response_parts.append(resp)
             if response_parts:
                 self.dialogue.put(Message(role="assistant", content="，".join(response_parts)))
+                # RECORD 类工具（点歌等）是插件自己把提示语推进 TTS 队列的，这里不再重复播报，
+                # 但要记上"本轮念过话"，否则末尾的空响应兜底会再跟一句"没反应过来"。
+                self.spoken_this_turn = True
 
         if need_llm_tools:
             all_tool_calls = [
@@ -1706,6 +2075,30 @@ class ConnectionHandler:
 
         self.logger.bind(tag=TAG).debug("All audio states reset.")
 
+    # ── 任务保护（任务没做完不休眠）────────────────────────────────────────────
+    def begin_task(self):
+        """标记一个任务开始：任务执行期间的静默不算"用户没说话"。"""
+        self.active_tasks += 1
+        if self.active_tasks == 1:
+            self.task_busy_since = time.time()
+
+    def end_task(self):
+        """标记任务结束：空闲时间从任务结束这一刻重新算起。"""
+        self.active_tasks = max(0, self.active_tasks - 1)
+        if self.active_tasks == 0:
+            self.task_busy_since = 0.0
+            # 任务执行期间一直没刷新过活动时间，这里必须补一次；
+            # 否则任务一结束就立刻满足 120 秒空闲，直接进结束语/休眠。
+            self.last_activity_time = time.time() * 1000
+
+    def task_in_progress(self) -> bool:
+        """有任务正在执行就返回 True（超过保护上限视为卡死，不再延长会话）。"""
+        if self.active_tasks <= 0:
+            return False
+        if self.task_busy_since <= 0.0:
+            return True
+        return (time.time() - self.task_busy_since) < self.task_busy_max
+
     def chat_and_close(self, text):
         """Chat with the user and then close the connection"""
         try:
@@ -1721,6 +2114,10 @@ class ConnectionHandler:
         """检查连接超时"""
         try:
             while not self.stop_event.is_set():
+                # 任务执行中的静默不算超时：桌宠正在做用户交代的事，这时候断开会显得"任务没做完就睡了"
+                if self.task_in_progress():
+                    await asyncio.sleep(10)
+                    continue
                 last_activity_time = self.last_activity_time
                 if self.need_bind:
                     last_activity_time = self.first_activity_time

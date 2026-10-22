@@ -10,3 +10,5 @@ class TextMessageType(Enum):
     MCP = "mcp"
     SERVER = "server"
     PING = "ping"
+    # 桌宠音量状态上报（客户端 → 服务端，配合 features.volume 与 set_pet_volume 工具）
+    PET_VOLUME = "pet_volume"

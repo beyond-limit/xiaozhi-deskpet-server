@@ -59,6 +59,11 @@ class ASRProviderBase(ABC):
 
     # 接收音频
     async def receive_audio(self, conn: "ConnectionHandler", pcm_frame, audio_have_voice):
+        # 兜底：manual 模式不会自动清理，VAD 误判时也可能长时间不触发识别。
+        # 60ms/帧，1000 帧 ≈ 60 秒，超出就丢最旧的，避免长连接内存线性上涨。
+        if len(conn.asr_audio) >= 1000:
+            del conn.asr_audio[: len(conn.asr_audio) - 999]
+
         if conn.client_listen_mode == "manual":
             # 手动模式：缓存音频用于ASR识别
             conn.asr_audio.append(pcm_frame)

@@ -261,6 +261,15 @@ class _RecordingShim:
         pass
 
     def __getattr__(self, attr):
+        # pytest（9.x）在收集测试函数时会遍历其属性以查找 Mark 标记
+        # （_pytest.mark.structures.get_unpacked_marks）。若对任意属性名都返回
+        # 可调用对象，pytest 会抛
+        #   TypeError: got <function ...> instead of Mark
+        # 并中断整个收集阶段。因此对 dunder / pytest_ 前缀 / 已知的 pytest 内部
+        # 属性名必须按"属性不存在"处理。
+        if attr.startswith("__") or attr.startswith("pytest_"):
+            raise AttributeError(attr)
+
         def _record(*args, **kwargs):
             type(self)._calls.append((attr, args, kwargs))
             return _RecordingShim()

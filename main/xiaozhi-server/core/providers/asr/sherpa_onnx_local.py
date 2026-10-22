@@ -1,3 +1,5 @@
+import asyncio
+import threading
 import time
 import wave
 import os
@@ -38,6 +40,8 @@ class ASRProvider(ASRProviderBase):
     def __init__(self, config: dict, delete_audio_file: bool):
         super().__init__()
         self.interface_type = InterfaceType.LOCAL
+        # 同一 recognizer 实例不保证并发解码安全（provider 是进程级共享的）
+        self._decode_lock = threading.Lock()
         self.model_dir = config.get("model_dir")
         self.output_dir = config.get("output_dir")
         self.model_type = config.get("model_type", "sense_voice")  # 支持 paraformer
@@ -134,11 +138,19 @@ class ASRProvider(ASRProviderBase):
             file_path = artifacts.file_path
 
             start_time = time.time()
-            s = self.model.create_stream()
-            samples, sample_rate = self.read_wave(file_path)
-            s.accept_waveform(sample_rate, samples)
-            self.model.decode_stream(s)
-            text = s.result.text
+
+            def _decode() -> str:
+                # sherpa-onnx 的识别是同步 CPU 推理（单句 100~500ms）
+                with self._decode_lock:
+                    s = self.model.create_stream()
+                    samples, sample_rate = self.read_wave(file_path)
+                    s.accept_waveform(sample_rate, samples)
+                    self.model.decode_stream(s)
+                    return s.result.text
+
+            # 放到线程里跑：否则整句识别期间事件循环完全停摆，
+            # 所有连接的音频收发 / TTS 发送都会被卡住。
+            text = await asyncio.to_thread(_decode)
             logger.bind(tag=TAG).debug(
                 f"语音识别耗时: {time.time() - start_time:.3f}s | 结果: {text}"
             )

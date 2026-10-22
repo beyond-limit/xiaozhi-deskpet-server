@@ -2,7 +2,11 @@ import os
 import uuid
 import edge_tts
 from datetime import datetime
+from config.logger import setup_logging
 from core.providers.tts.base import TTSProviderBase
+
+TAG = __name__
+logger = setup_logging()
 
 
 class TTSProvider(TTSProviderBase):
@@ -36,6 +40,16 @@ class TTSProvider(TTSProviderBase):
         self.edge_volume = f"{self.volume:+}%"
         self.edge_pitch = f"{self.pitch_rate:+}Hz"
 
+        # 代理支持。
+        # 背景：微软对 readaloud 的 WSS 端点按来源做策略性拒绝（中国大陆出口实测恒返回
+        # 空 body 的 403，而同域名 voices/list 的普通 HTTPS 仍为 200），
+        # 与 Sec-MS-GEC 参数是否正确无关。edge-tts 原生支持 proxy，
+        # 走代理是本机唯一能让 EdgeTTS 真正可用的办法。
+        # 取值示例：http://127.0.0.1:7890 / http://127.0.0.1:10808（v2rayN 默认 http 端口）
+        self.proxy = (config.get("proxy") or "").strip() or None
+        if self.proxy:
+            logger.bind(tag=TAG).info(f"EdgeTTS 启用代理: {self.proxy}")
+
     def generate_filename(self, extension=".mp3"):
         return os.path.join(
             self.output_file,
@@ -50,6 +64,7 @@ class TTSProvider(TTSProviderBase):
                 rate=self.edge_rate,
                 volume=self.edge_volume,
                 pitch=self.edge_pitch,
+                proxy=self.proxy,
             )
             if output_file:
                 # 确保目录存在并创建空文件

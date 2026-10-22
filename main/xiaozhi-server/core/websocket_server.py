@@ -44,6 +44,10 @@ class WebSocketServer:
         self.config = config
         self.logger = setup_logging(config)
         self.config_lock = asyncio.Lock()
+        self.active_connections = set()
+        # device_id -> ConnectionHandler：提醒到点、离线补播都靠它找"当前在线的那条连接"
+        # （session_id 每次连接都会变，只有 device_id 稳定：ESP 是 MAC，桌宠是 deskpet-01）
+        self.connections_by_device: dict = {}
         modules = initialize_modules(
             self.logger,
             self.config,
@@ -127,11 +131,18 @@ class WebSocketServer:
             self._intent,
             self,  # 传入server实例
         )
+        device_id = str(websocket.request.headers.get("device-id", "") or "")
+        self.active_connections.add(handler)
+        if device_id:
+            self.connections_by_device[device_id] = handler
         try:
             await handler.handle_connection(websocket)
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"处理连接时出错: {e}")
         finally:
+            self.active_connections.discard(handler)
+            if device_id and self.connections_by_device.get(device_id) is handler:
+                self.connections_by_device.pop(device_id, None)
             # 强制关闭连接（如果还没有关闭的话）
             try:
                 # 安全地检查WebSocket状态并关闭

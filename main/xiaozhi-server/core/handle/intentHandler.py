@@ -34,7 +34,11 @@ async def handle_user_intent(conn: "ConnectionHandler", text):
         return True
 
     # 检查是否是唤醒词
-    if await checkWakeupWords(conn, filtered_text):
+    # 输入框发来的文本（skip_wakeup_reply=True）跳过这套预置回复：用户是在正常对话，
+    # 不是"喊了一声唤醒词等开场白"。
+    if not getattr(conn, "skip_wakeup_reply", False) and await checkWakeupWords(
+        conn, filtered_text
+    ):
         return True
 
     if conn.intent_type == "function_call":
@@ -212,8 +216,10 @@ async def process_intent_result(
                         text = result.response if result.response else result.result
                         if text is not None:
                             speak_txt(conn, text)
-                    elif function_name != "play_music":
+                    elif function_name not in ("play_music", "play_song"):
                         # For backward compatibility with original code
+                        # play_music / play_song 返回 Action.RECORD 且自行推送了
+                        # TTS 队列（文本 + 音频文件），这里不能再播报一次。
                         # 获取当前最新的文本索引
                         text = result.response
                         if text is None:

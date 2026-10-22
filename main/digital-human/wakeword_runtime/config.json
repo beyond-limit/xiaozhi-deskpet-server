@@ -11,11 +11,11 @@
   "detector": {
     "num_threads": 4,
     "provider": "cpu",
-    "max_active_paths": 2,
-    "keywords_score": 1.8,
-    "keywords_threshold": 0.1,
+    "max_active_paths": 4,
+    "keywords_score": 2.4,
+    "keywords_threshold": 0.2,
     "num_trailing_blanks": 1,
-    "cooldown_seconds": 1.5
+    "cooldown_seconds": 2.0
   },
   "logging": {
     "level": "INFO",
